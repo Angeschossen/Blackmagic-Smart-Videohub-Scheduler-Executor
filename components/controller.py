@@ -32,6 +32,7 @@ class Videohub:
         self.inputs = [] # in case hub does not send initial config
         self.outputs = []
         self.connected = False
+        self.sock = None
 
     async def load_initial(self, text):
         self.info("Loading initial data.")
@@ -68,6 +69,8 @@ class Videohub:
 
         await self.save()
         self.info("Initial data loaded.")
+
+        self.send_routing_update(self.outputs[0].id, self.inputs[1].id)
 
 
     async def connect_callback(self):
@@ -112,37 +115,56 @@ class Videohub:
 
                 self.info(f"Routing updated: {self.id}: ({output_id}, {input_id})")
 
-    def socket_connect(self, sock):
+    def socket_connect(self):
         if self.connected: # prevent error
-            raise Exception(f"[{self.id}] Already connected.")
+            raise Exception(f"[{self.id}] Tried to connect, but already is.")
             return
 
-        if sock is not None:
+        if self.sock is not None:
             try:
-                sock.close() # make sure to close prev one and release memory
+                self.sock.close() # make sure to close prev one and release memory
             except socket.error:
                 logging.exception(f"[{self.id}] Failed to close old socket.")
                 return
 
         c = 1
-        sock = socket.socket() # create new one
+        self.sock = socket.socket() # create new one
         while not self.connected:
             try:
-                self.info(f"Attempting connection (#{c}).")
-                sock.connect((self.ip, 9990))
+                self.establish_connection(self.sock, c)
+                self.sock.send(b'Hello!')
                 self.connected = True
-                self.info("Connected to socket.")
-                return sock
+                return self.sock
             except socket.error:
                 logging.exception(f"[{self.id}] Couldn't connect to socket.")
                 time.sleep(2)
                 c += 1
 
+    def establish_connection(self, sock, c):
+        self.info(f"Attempting connection (#{c}).")
+        sock.connect((self.ip, 9990))
+        self.info("Connected to socket.")
+
+    def send_routing_update(self, output, input):
+        send = f"{VIDEO_OUTPUT_ROUTING}\n{output} {input}\n"
+        self.info(f"Sending routing update: {output}:{input}")
+
+        sock = socket.socket()
+        try:
+            self.establish_connection(sock, 1)
+            sock.recv(1024).decode('utf-8') # skip preamble
+
+            sock.send(send.encode()) # send routing update
+            self.info("Routing update sent.")
+        except socket.error:
+            logging.exception(f"[{self.id}] Couldn't send routing update to videohub.")
+        finally:
+            sock.close()
 
 
     async def connect(self):
         try:
-            sock = self.socket_connect(None) # initial
+            sock = self.socket_connect() # initial
 
             while True:
                 try:
@@ -150,7 +172,7 @@ class Videohub:
                 except socket.error:
                     logging.exception(f"[{self.id}] Lost connection. Attempting reconnect.")
                     self.connected = False
-                    sock = self.socket_connect(sock)
+                    sock = self.socket_connect()
 
         except Exception:
             logging.exception(f"[{self.id}] Failed to connect.")
@@ -284,3 +306,9 @@ async def init_controller() -> None:
 async def destroy():
     await prisma.disconnect()
     logging.info("DB disconnected.")
+
+    for hub in videohubs:
+        if hub.sock is not None:
+            sock.close()
+
+    logging.info("Closed sockets.")
