@@ -10,7 +10,7 @@ import functools
 
 
 INPUT_LABELS = "INPUT LABELS:"
-PROTOCOL_PREAMPLE = "PROTOCOL PREAMPLE:"
+PROTOCOL_PREAMPLE = "PROTOCOL PREAMBLE:"
 PROTOCOL_VIDEOHUB_DEVICE = "VIDEOHUB DEVICE:"
 OUTPUT_START = "OUTPUT LABELS:"
 VIDEO_OUTPUT_ROUTING = "VIDEO OUTPUT ROUTING:"
@@ -18,7 +18,7 @@ FRIENDLY_NAME = "Friendly name:"
 
 PROTOCOL_LATEST_VERSION = "2.8"
 
-CONNECTION_RETRY_DELAY = 2
+CONNECTION_RETRY_DELAY = 60
 
 videohubs = []
 prisma = Prisma()
@@ -29,12 +29,17 @@ class Input:
         self.id = int(id)
         self.label = label
 
+    def __eq__(self, obj):
+        return isinstance(obj, Input) and obj.id == self.id
+
 class Output:
     def __init__(self, id, label):
         self.id = int(id)
         self.label = label
         self.input_id = None
 
+    def __eq__(self, obj):
+        return isinstance(obj, Output) and obj.id == self.id
 
 class VideohubClient(asyncio.Protocol):
     message = 'Testing'
@@ -126,8 +131,7 @@ class Videohub():
         if data.startswith(PROTOCOL_PREAMPLE): # preample:
             lines = getCorrespondingLines(getLines(data), PROTOCOL_PREAMPLE)
             self.version = lines[1]
-
-        if data.startswith(PROTOCOL_VIDEOHUB_DEVICE): # initial
+        elif data.startswith(PROTOCOL_VIDEOHUB_DEVICE): # initial
             await self.load_initial(data)
         elif data.startswith(VIDEO_OUTPUT_ROUTING): # update routing
             lines = getCorrespondingLines(getLines(data), VIDEO_OUTPUT_ROUTING)
@@ -203,7 +207,7 @@ class Videohub():
                 self.connected = True
                 self.info("Establishing connection...")
             except OSError:
-                logging.exception(f"[{self.id}] Couldn't connect to socket. Trying again in {CONNECTION_RETRY_DELAY} second(s).")
+                logging.exception(f"[{self.id}] Couldn't connect to socket. Trying again in {CONNECTION_RETRY_DELAY} minute(s).")
                 yield from asyncio.sleep(CONNECTION_RETRY_DELAY)
                 c += 1
             else:
@@ -298,6 +302,7 @@ class Videohub():
         date_end = date_start + timedelta(minutes=1)
         try:
             while True:
+                print(self.connected)
                 if self.connected:
                     events = await prisma.event.find_many(
                         where= {
@@ -337,14 +342,26 @@ class Videohub():
                         }
                     )
 
+                    print(events)
                     for event in events:
                         output_id = event.output_id
-                        input_id = event.input_id
+                        shortest_id = event.input_id # initial
+                        shortest_duration = event.end - event.start
 
-                        if self.outputs[output_id].input_id == input_id:
+                        for e in events:
+                            if output_id != e.output_id or event == e: # not same output
+                                continue
+
+                            duration = e.end - e.start
+                            if duration < shortest_duration:
+                                shortest_id = e.input_id
+                                shortest_duration = duration
+
+                        print(shortest_id)
+                        if self.outputs[output_id].input_id == shortest_id:
                             continue # up to date
 
-                        await self.send_routing_update(output_id, input_id)
+                        await self.send_routing_update(output_id, shortest_id)
 
                 await asyncio.sleep(5)
         except:
