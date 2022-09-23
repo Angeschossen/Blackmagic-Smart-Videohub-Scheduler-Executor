@@ -6,6 +6,7 @@ import sys
 from threading import Thread
 import logging
 from datetime import datetime, timedelta
+import functools
 
 
 INPUT_LABELS = "INPUT LABELS:"
@@ -14,8 +15,11 @@ OUTPUT_START = "OUTPUT LABELS:"
 VIDEO_OUTPUT_ROUTING = "VIDEO OUTPUT ROUTING:"
 FRIENDLY_NAME = "Friendly name:"
 
+CONNECTION_RETRY_DELAY = 2
+
 videohubs = []
 prisma = Prisma()
+loop = asyncio.get_event_loop()
 
 class Input:
     def __init__(self, id, label):
@@ -28,7 +32,47 @@ class Output:
         self.label = label
         self.input_id = None
 
-class Videohub:
+
+class VideohubClient(asyncio.Protocol):
+    message = 'Testing'
+
+    def __init__(self, hub):
+        self.hub = hub
+
+    def info(self, msg):
+        self.hub.info(msg)
+
+    def connection_made(self, transport):
+        self.transport = transport
+        self.transport.write(b'Hello!')
+        self.hub.connected = True
+        self.hub.sock = self
+        self.info("Connected.")
+        #server_udp[1].tcp_client_connected()
+
+
+    def data_received(self, data):
+        data = data.decode('utf-8')
+        self.info(f"Received: {data!r}")
+        loop.create_task(self.hub.handle_received(data))
+        #if self.data == 'Testing':
+            #server_udp[1].send_data_to_udp(self.data)
+
+    def send_data_to_tcp(self, data):
+        print("Send")
+        self.transport.write(data.encode())
+        self.info(f"Sending: {data}")
+
+    def connection_lost(self, exc):
+        msg = 'Connection lost with the server...'
+        #info = self.transport.get_extra_info('peername')
+        self.hub.connected = False
+        self.info("Connection lost. Attempting reconnect.")
+        self.hub.connect()
+        #server_udp[1].tcp_client_disconnected(msg, info)
+
+
+class Videohub():
     def __init__(self, id, ip):
         self.id = int(id)
         self.ip = ip
@@ -78,13 +122,7 @@ class Videohub:
         #self.send_routing_update(self.outputs[0].id, self.inputs[1].id)
 
 
-    async def run_loop(self, sock):
-        #reader, writer = yield from asyncio.open_connection(HOST, PORT)
-
-        self.info("Waiting for data...")
-        data = sock.recv(1024).decode('utf-8')
-        self.info(f"Received: {data!r}")
-
+    async def handle_received(self, data):
         if data.startswith(PROTOCOL_PREAMPLE): # initial
             await self.load_initial(data)
         elif data.startswith(VIDEO_OUTPUT_ROUTING): # update routing
@@ -120,30 +158,37 @@ class Videohub:
 
                 self.info(f"Routing updated: {self.id}: ({output_id}, {input_id})")
 
+    def connect_initial(self):
+        self.connect()
+        loop.create_task(self.check_events())
+        self.info("Inital tasks started.")
+
+    def connect(self):
+        try:
+            loop.create_task(self.socket_connect())
+        except:
+            logging.exception("Failed to connect.")
+
+    @asyncio.coroutine
     def socket_connect(self):
         if self.connected: # prevent error
             raise Exception(f"[{self.id}] Tried to connect, but already is.")
             return
 
-        if self.sock is not None:
-            try:
-                self.sock.close() # make sure to close prev one and release memory
-            except socket.error:
-                logging.exception(f"[{self.id}] Failed to close old socket.")
-                return
-
         c = 1
-        self.sock = socket.socket() # create new one
-        while not self.connected:
+        while True:
             try:
-                self.establish_connection(self.sock, c)
+                self.info(f"Trying to connect (#{c})")
+                call = functools.partial(VideohubClient, hub=self)
+                yield from loop.create_connection(call, self.ip, 9990)
                 self.connected = True
-                return self.sock
-            except socket.error:
-                logging.exception(f"[{self.id}] Couldn't connect to socket.")
-                print("Sleep")
-                time.sleep(2)
+                self.info("Establishing connection...")
+            except OSError:
+                logging.exception(f"[{self.id}] Couldn't connect to socket. Trying again in {CONNECTION_RETRY_DELAY} second(s).")
+                yield from asyncio.sleep(CONNECTION_RETRY_DELAY)
                 c += 1
+            else:
+                break
 
     def establish_connection(self, sock, c):
         self.info(f"Attempting connection (#{c}).")
@@ -154,34 +199,11 @@ class Videohub:
         send = f"{VIDEO_OUTPUT_ROUTING}\n{output} {input}\n"
         self.info(f"Sending routing update: {output}:{input}")
 
-        sock = socket.socket()
         try:
-            self.establish_connection(sock, 1)
-            sock.recv(1024).decode('utf-8') # skip preamble
-
-            sock.send(send.encode()) # send routing update
+            self.sock.send_data_to_tcp(send)
             self.info("Routing update sent.")
         except socket.error:
             logging.exception(f"[{self.id}] Couldn't send routing update to videohub.")
-        finally:
-            sock.close()
-
-
-    async def connect(self):
-        try:
-            sock = self.socket_connect() # initial
-
-            while True:
-                try:
-                    await self.run_loop(sock)
-                except socket.error:
-                    logging.exception(f"[{self.id}] Lost connection. Attempting reconnect.")
-                    self.connected = False
-                    sock = self.socket_connect()
-
-        except Exception:
-            logging.exception(f"[{self.id}] Failed to connect.")
-
 
     def info(self, msg):
         m = f"[{self.id}] {msg}"
@@ -239,6 +261,57 @@ class Videohub:
         except:
             logging.exception(f"[{self.id}] Failed to save inputs or outputs.")
 
+    async def check_events(self) -> None:
+        print("AAAA")
+        date_start = datetime.utcnow()
+        date_end = date_start + timedelta(minutes=1)
+        try:
+            while True:
+                if self.connected:
+                    print(f"{date_start} {date_end}")
+                    events = await prisma.event.find_many(
+                        where= {
+                            'AND': [
+                                {
+                                    'videohub_id': self.id
+                                },
+                                {
+                                    'OR': [
+                                        {
+                                            'AND': [
+                                                {
+                                                    'start': {
+                                                        'lte': date_start,
+                                                    },
+                                                    'end': {
+                                                        'gte': date_end,
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            'start': {
+                                                'gte': date_start,
+                                                'lte': date_end,
+                                            }
+                                        },
+                                        {
+                                            'end': {
+                                                'lte': date_end,
+                                                'gte': date_start,
+                                            }
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    )
+
+                    print(events)
+                await asyncio.sleep(10)
+        except:
+            logging.exception("Error at loop")
+
     def __eq__(self, obj):
         return isinstance(obj, Videohub) and obj.id == self.id
 
@@ -282,9 +355,7 @@ async def get_next_events():
     #date_end = date_start + timedelta(minutes=1)
 
     try:
-        print("===== EVENTS")
         events = await prisma.event.find_many()
-        print("Got them")
         return events
     except:
         logging.exception("Error")
@@ -294,37 +365,13 @@ def get_videohub(id) -> Videohub:
         if hub.id == id:
             return hub
 
-async def check_events() -> None:
-
-    try:
-
-        while True:
-            print("Try")
-            events = await prisma.event.find_many()
-            print(events)
-            print("Got")
-            await asyncio.sleep(1)
-
-    except:
-        logging.exception("Error at loop")
-
 def start() -> None:
     loop = asyncio.get_event_loop()
-    tasks = []
-    tasks.append(loop.create_task(check_events()))
-
     for hub in videohubs:
-        tasks.append(loop.create_task(hub.connect()))
+        hub.connect_initial()
+        #loop.run_until_complete(hub.socket_connect())
 
-    print(len(tasks))
-    #asyncio.run(get_next_events())
-    loop.run_until_complete(asyncio.wait(tasks))
-
-async def loop() -> None:
-    while True:
-        await get_next_events()
-        print("Sleep")
-        time.sleep(5)
+    loop.run_forever()
 
 async def init_controller() -> None:
     print("Controller init...")
