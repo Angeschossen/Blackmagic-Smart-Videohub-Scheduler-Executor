@@ -14,6 +14,9 @@ OUTPUT_START = "OUTPUT LABELS:"
 VIDEO_OUTPUT_ROUTING = "VIDEO OUTPUT ROUTING:"
 FRIENDLY_NAME = "Friendly name:"
 
+videohubs = []
+prisma = Prisma()
+
 class Input:
     def __init__(self, id, label):
         self.id = int(id)
@@ -72,12 +75,12 @@ class Videohub:
         await self.save()
         self.info("Initial data loaded.")
 
-        self.send_routing_update(self.outputs[0].id, self.inputs[1].id)
+        #self.send_routing_update(self.outputs[0].id, self.inputs[1].id)
 
-    async def connect_callback(self):
-        await self.connect()
 
     async def run_loop(self, sock):
+        #reader, writer = yield from asyncio.open_connection(HOST, PORT)
+
         self.info("Waiting for data...")
         data = sock.recv(1024).decode('utf-8')
         self.info(f"Received: {data!r}")
@@ -101,6 +104,7 @@ class Videohub:
                     self.info(f"Input not loaded: Id: {input_id}")
                     continue
 
+                self.info(f"Updating routing: ({output_id}, {input_id})")
                 self.outputs[output_id].input_id = input_id
                 await prisma.output.update(
                     where={
@@ -137,6 +141,7 @@ class Videohub:
                 return self.sock
             except socket.error:
                 logging.exception(f"[{self.id}] Couldn't connect to socket.")
+                print("Sleep")
                 time.sleep(2)
                 c += 1
 
@@ -229,10 +234,10 @@ class Videohub:
                         },
                     },
                 )
+
+            self.info("Saved.")
         except:
             logging.exception(f"[{self.id}] Failed to save inputs or outputs.")
-
-        self.info("Saved.")
 
     def __eq__(self, obj):
         return isinstance(obj, Videohub) and obj.id == self.id
@@ -273,77 +278,54 @@ def getLines(input):
     return lines
 
 async def get_next_events():
-    date_start = datetime.now()
-    date_end = date_start + timedelta(minutes=1)
+    #date_start = datetime.now()
+    #date_end = date_start + timedelta(minutes=1)
 
     try:
-        events = await prisma.event.find_many(
-            where={
-                'OR': [
-                    {
-                        'AND': [
-                            {
-                                'start' : {
-                                    'lte': date_start,
-                                },
-                                'end' : {
-                                    'gte': date_end,
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'OR': [
-                            {
-                                'start':{
-                                    'gte': date_start,
-                                    'lte': date_end,
-                                },
-                                'end': {
-                                    'lte': date_end,
-                                    'gte': date_start,
-                                }
-                            }
-                        ]
-                    }
-                ]
-            }
-        )
-
-    except Exception:
+        print("===== EVENTS")
+        events = await prisma.event.find_many()
+        print("Got them")
+        return events
+    except:
         logging.exception("Error")
 
-    print("AAA")
-    print(events)
-    return events
-
-async def check_events():
-    while True:
-        try:
-            events = await get_next_events()
-        except:
-            logging.exception("Failed to retrieve next events")
-
-        await asyncio.sleep(60)
-
-videohubs = []
 def get_videohub(id) -> Videohub:
     for hub in videohubs:
         if hub.id == id:
             return hub
 
+async def check_events() -> None:
+
+    try:
+
+        while True:
+            print("Try")
+            events = await prisma.event.find_many()
+            print(events)
+            print("Got")
+            await asyncio.sleep(1)
+
+    except:
+        logging.exception("Error at loop")
 
 def start() -> None:
     loop = asyncio.get_event_loop()
     tasks = []
+    tasks.append(loop.create_task(check_events()))
+
     for hub in videohubs:
         tasks.append(loop.create_task(hub.connect()))
 
-    tasks.append(loop.create_task(check_events()))
+    print(len(tasks))
+    #asyncio.run(get_next_events())
     loop.run_until_complete(asyncio.wait(tasks))
 
-videohubs = []
-prisma = Prisma()
+async def loop() -> None:
+    while True:
+        await get_next_events()
+        print("Sleep")
+        time.sleep(5)
+
 async def init_controller() -> None:
     print("Controller init...")
     await prisma.connect()

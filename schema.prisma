@@ -12,10 +12,12 @@ datasource db {
 }
 
 model Event {
-  id          Int @id @default(autoincrement())
+  id          Int      @id @default(autoincrement())
   videohub    Videohub @relation(fields: [videohub_id], references: [id])
   videohub_id Int
+  output      Output   @relation(fields: [videohub_id, output_id], references: [videohub_id, id])
   output_id   Int
+  input       Input    @relation(fields: [videohub_id, input_id], references: [videohub_id, id])
   input_id    Int
   start       DateTime
   end         DateTime
@@ -37,6 +39,7 @@ model Input {
   videohub_id Int
   label       String
   outputs     Output[]
+  Event       Event[]
 
   @@id([videohub_id, id], name: "videohubInput")
 }
@@ -45,9 +48,10 @@ model Output {
   id          Int
   videohub    Videohub @relation(fields: [videohub_id], references: [id])
   videohub_id Int
-  input       Input?    @relation(fields: [videohub_id, input_id], references: [videohub_id, id])
+  input       Input?   @relation(fields: [videohub_id, input_id], references: [videohub_id, id])
   input_id    Int?
   label       String
+  Event       Event[]
 
   @@id([videohub_id, id], name: "videohubOutput")
 }
