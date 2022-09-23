@@ -11,9 +11,12 @@ import functools
 
 INPUT_LABELS = "INPUT LABELS:"
 PROTOCOL_PREAMPLE = "PROTOCOL PREAMPLE:"
+PROTOCOL_VIDEOHUB_DEVICE = "VIDEOHUB DEVICE:"
 OUTPUT_START = "OUTPUT LABELS:"
 VIDEO_OUTPUT_ROUTING = "VIDEO OUTPUT ROUTING:"
 FRIENDLY_NAME = "Friendly name:"
+
+PROTOCOL_LATEST_VERSION = "2.8"
 
 CONNECTION_RETRY_DELAY = 2
 
@@ -59,12 +62,10 @@ class VideohubClient(asyncio.Protocol):
             #server_udp[1].send_data_to_udp(self.data)
 
     def send_data_to_tcp(self, data):
-        print("Send")
         self.transport.write(data.encode())
         self.info(f"Sending: {data}")
 
     def connection_lost(self, exc):
-        msg = 'Connection lost with the server...'
         #info = self.transport.get_extra_info('peername')
         self.hub.connected = False
         self.info("Connection lost. Attempting reconnect.")
@@ -77,7 +78,7 @@ class Videohub():
         self.id = int(id)
         self.ip = ip
         self.name = "undefined"
-        self.version = "undefined"
+        self.version = PROTOCOL_LATEST_VERSION
         self.inputs = [] # in case hub does not send initial config
         self.outputs = []
         self.connected = False
@@ -88,8 +89,7 @@ class Videohub():
         lines = getLines(text)
 
         # ver and name
-        self.version = getConfigEntry(lines, 1)
-        self.name = getConfigEntry(lines, 6)
+        self.name = getConfigEntry(lines, 3)
 
         # inputs and outputs
         self.inputs = []
@@ -123,7 +123,11 @@ class Videohub():
 
 
     async def handle_received(self, data):
-        if data.startswith(PROTOCOL_PREAMPLE): # initial
+        if data.startswith(PROTOCOL_PREAMPLE): # preample:
+            lines = getCorrespondingLines(getLines(data), PROTOCOL_PREAMPLE)
+            self.version = lines[1]
+
+        if data.startswith(PROTOCOL_VIDEOHUB_DEVICE): # initial
             await self.load_initial(data)
         elif data.startswith(VIDEO_OUTPUT_ROUTING): # update routing
             lines = getCorrespondingLines(getLines(data), VIDEO_OUTPUT_ROUTING)
@@ -133,30 +137,45 @@ class Videohub():
                 line = lines[i]
                 data = line.split(" ")
                 output_id = int(data[0])
-                if output_id >= len(self.outputs):
-                    self.info(f"Output not loaded. Id: {output_id}")
-                    continue
-
                 input_id = int(data[1])
-                if input_id >= len(self.inputs):
-                    self.info(f"Input not loaded: Id: {input_id}")
-                    continue
 
-                self.info(f"Updating routing: ({output_id}, {input_id})")
-                self.outputs[output_id].input_id = input_id
-                await prisma.output.update(
-                    where={
-                        'videohubOutput': {
-                            'videohub_id': self.id,
-                            'id': output_id,
-                        }
-                    },
-                    data={
-                        'input_id' : input_id,
-                    },
-                )
+                await self.update_routing(output_id, input_id)
+        else:
+            self.info("Unknown message.")
 
-                self.info(f"Routing updated: {self.id}: ({output_id}, {input_id})")
+
+    def validate_relation(self, input_id, output_id):
+        if output_id >= len(self.outputs):
+            self.info(f"Output not loaded. Id: {output_id}")
+            return False
+
+        if input_id >= len(self.inputs):
+            self.info(f"Input not loaded: Id: {input_id}")
+            return False
+
+        return True
+
+    async def update_routing(self, output_id, input_id):
+        self.info(f"Updating routing in database: ({output_id}, {input_id})")
+
+        if not self.validate_relation(input_id, output_id):
+            return False
+
+        self.outputs[output_id].input_id = input_id
+        await prisma.output.update(
+            where={
+                'videohubOutput': {
+                    'videohub_id': self.id,
+                    'id': output_id,
+                }
+            },
+            data={
+                'input_id' : input_id,
+            },
+        )
+
+        self.info(f"Routing in db updated: ({output_id}, {input_id})")
+        return True
 
     def connect_initial(self):
         self.connect()
@@ -195,15 +214,19 @@ class Videohub():
         sock.connect((self.ip, 9990))
         self.info("Connected to socket.")
 
-    def send_routing_update(self, output, input):
+    async def send_routing_update(self, output, input):
         send = f"{VIDEO_OUTPUT_ROUTING}\n{output} {input}\n"
         self.info(f"Sending routing update: {output}:{input}")
+        if not self.validate_relation(output, input):
+            return False
 
         try:
             self.sock.send_data_to_tcp(send)
             self.info("Routing update sent.")
         except socket.error:
             logging.exception(f"[{self.id}] Couldn't send routing update to videohub.")
+
+        return await self.update_routing(output, input)
 
     def info(self, msg):
         m = f"[{self.id}] {msg}"
@@ -214,6 +237,15 @@ class Videohub():
         self.info("Saving.")
 
         try:
+            await prisma.videohub.update(
+                where={
+                    'id': self.id,
+                },
+                data={
+                    'name': self.name,
+                }
+            )
+
             for input in self.inputs:
                 id = input.id
                 inp = await prisma.input.upsert(
@@ -262,13 +294,11 @@ class Videohub():
             logging.exception(f"[{self.id}] Failed to save inputs or outputs.")
 
     async def check_events(self) -> None:
-        print("AAAA")
         date_start = datetime.utcnow()
         date_end = date_start + timedelta(minutes=1)
         try:
             while True:
                 if self.connected:
-                    print(f"{date_start} {date_end}")
                     events = await prisma.event.find_many(
                         where= {
                             'AND': [
@@ -307,8 +337,16 @@ class Videohub():
                         }
                     )
 
-                    print(events)
-                await asyncio.sleep(10)
+                    for event in events:
+                        output_id = event.output_id
+                        input_id = event.input_id
+
+                        if self.outputs[output_id].input_id == input_id:
+                            continue # up to date
+
+                        await self.send_routing_update(output_id, input_id)
+
+                await asyncio.sleep(5)
         except:
             logging.exception("Error at loop")
 
