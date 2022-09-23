@@ -5,6 +5,8 @@ import time
 import sys
 from threading import Thread
 import logging
+from datetime import datetime, timedelta
+
 
 INPUT_LABELS = "INPUT LABELS:"
 PROTOCOL_PREAMPLE = "PROTOCOL PREAMPLE:"
@@ -72,7 +74,6 @@ class Videohub:
 
         self.send_routing_update(self.outputs[0].id, self.inputs[1].id)
 
-
     async def connect_callback(self):
         await self.connect()
 
@@ -132,7 +133,6 @@ class Videohub:
         while not self.connected:
             try:
                 self.establish_connection(self.sock, c)
-                self.sock.send(b'Hello!')
                 self.connected = True
                 return self.sock
             except socket.error:
@@ -272,6 +272,60 @@ def getLines(input):
 
     return lines
 
+async def get_next_events():
+    date_start = datetime.now()
+    date_end = date_start + timedelta(minutes=1)
+
+    try:
+        events = await prisma.event.find_many(
+            where={
+                'OR': [
+                    {
+                        'AND': [
+                            {
+                                'start' : {
+                                    'lte': date_start,
+                                },
+                                'end' : {
+                                    'gte': date_end,
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        'OR': [
+                            {
+                                'start':{
+                                    'gte': date_start,
+                                    'lte': date_end,
+                                },
+                                'end': {
+                                    'lte': date_end,
+                                    'gte': date_start,
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+        )
+
+    except Exception:
+        logging.exception("Error")
+
+    print("AAA")
+    print(events)
+    return events
+
+async def check_events():
+    while True:
+        try:
+            events = await get_next_events()
+        except:
+            logging.exception("Failed to retrieve next events")
+
+        await asyncio.sleep(60)
+
 videohubs = []
 def get_videohub(id) -> Videohub:
     for hub in videohubs:
@@ -285,6 +339,7 @@ def start() -> None:
     for hub in videohubs:
         tasks.append(loop.create_task(hub.connect()))
 
+    tasks.append(loop.create_task(check_events()))
     loop.run_until_complete(asyncio.wait(tasks))
 
 videohubs = []
